@@ -273,7 +273,8 @@ async function checkNewMessages() {
       offset: lastUpdateId + 1,
       limit: 100,
       timeout: 0
-    }
+    },
+    timeout: 10000
   });
 
   let hasNew = false;
@@ -298,11 +299,145 @@ async function checkNewMessages() {
 }
 
 /**
- * Inject text into terminal using SendInput API
- * Finds and activates terminal window, then sends keyboard events
+ * Inject text into terminal using Hammerspoon (hs CLI)
+ * More reliable than AppleScript - uses CGEvent API
  * Returns: { success: boolean, error?: string, method?: string }
  */
+function injectViaHammerspoon(text) {
+  try {
+    // Check if hs CLI is available
+    try {
+      execSync('which hs', { encoding: 'utf8', timeout: 5000 });
+    } catch {
+      return { success: false, error: 'Hammerspoon CLI (hs) not found' };
+    }
+
+    const singleLine = text.replace(/[\r\n]+/g, ' ').trim();
+    if (!singleLine) {
+      return { success: false, error: 'Empty text' };
+    }
+
+    // Escape text for Lua string (backslashes, quotes, brackets)
+    const escaped = singleLine
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\n/g, '\\n');
+
+    // Type the text using Hammerspoon's eventtap
+    execSync(`hs -c 'hs.eventtap.keyStrokes("${escaped}")'`, {
+      encoding: 'utf8',
+      timeout: 10000
+    });
+
+    // Small delay to ensure text is fully typed
+    execSync('sleep 0.1');
+
+    // Press Enter
+    execSync(`hs -c 'hs.eventtap.keyStroke({}, "return")'`, {
+      encoding: 'utf8',
+      timeout: 5000
+    });
+
+    return { success: true, method: 'Hammerspoon' };
+  } catch (error) {
+    console.error('Hammerspoon injection failed:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Inject text into terminal on macOS
+ * Tries Hammerspoon first, falls back to AppleScript
+ * Returns: { success: boolean, error?: string, method?: string }
+ */
+function injectToTerminalMacOS(text) {
+  // Try Hammerspoon first (more reliable)
+  const hsResult = injectViaHammerspoon(text);
+  if (hsResult.success) {
+    return hsResult;
+  }
+  console.error('Hammerspoon unavailable, falling back to AppleScript:', hsResult.error);
+
+  // Fall back to AppleScript
+  try {
+    const singleLine = text.replace(/[\r\n]+/g, ' ').trim();
+    if (!singleLine) {
+      return { success: false, error: 'Empty text' };
+    }
+
+    // Write text to temp file to avoid AppleScript escaping issues
+    const tempFile = path.join(tempDir, 'telegram-mcp-cmd.txt');
+    fs.writeFileSync(tempFile, singleLine, 'utf8');
+
+    // AppleScript: read text from file, set clipboard, paste into frontmost terminal, press Enter
+    // Supports Terminal.app and iTerm2
+    const appleScript = `
+set textContent to (do shell script "cat '${tempFile.replace(/'/g, "'\\''")}'")
+set the clipboard to textContent
+
+-- Try to find and activate a terminal app
+set terminalApp to ""
+try
+  tell application "System Events"
+    set procNames to name of every process whose background only is false
+  end tell
+  if procNames contains "Terminal" then
+    set terminalApp to "Terminal"
+  else if procNames contains "iTerm2" then
+    set terminalApp to "iTerm2"
+  else if procNames contains "kitty" then
+    set terminalApp to "kitty"
+  else if procNames contains "Alacritty" then
+    set terminalApp to "Alacritty"
+  else if procNames contains "WezTerm" then
+    set terminalApp to "WezTerm"
+  end if
+on error
+  set terminalApp to ""
+end try
+
+if terminalApp is "" then
+  error "No terminal application found"
+end if
+
+tell application terminalApp to activate
+delay 0.3
+
+-- Paste and press Enter
+tell application "System Events"
+  keystroke "v" using command down
+  delay 0.1
+  key code 36 -- Enter key
+end tell
+
+return "OK"
+`;
+
+    const scriptPath = path.join(tempDir, 'telegram-mcp-inject.scpt');
+    fs.writeFileSync(scriptPath, appleScript, 'utf8');
+
+    const result = execSync(`osascript "${scriptPath}"`, {
+      encoding: 'utf8',
+      timeout: 15000
+    }).trim();
+
+    if (result === 'OK') {
+      return { success: true, method: 'AppleScript' };
+    }
+    return { success: false, error: result };
+  } catch (error) {
+    console.error('macOS AppleScript injection failed:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
 function injectToTerminal(text) {
+  // macOS: use AppleScript
+  if (process.platform === 'darwin') {
+    return injectToTerminalMacOS(text);
+  }
+
+  // Windows: use PowerShell + SendInput
   try {
     // Replace newlines with spaces for single-line injection
     const singleLine = text.replace(/[\r\n]+/g, ' ').trim();
@@ -654,7 +789,8 @@ async function pollAndInject() {
         offset: lastUpdateId + 1,
         limit: 10,
         timeout: 0
-      }
+      },
+      timeout: 10000
     });
 
     if (response.data.ok && response.data.result.length > 0) {
@@ -757,7 +893,7 @@ function stopPolling() {
 const server = new Server(
   {
     name: 'telegram-claude-mcp',
-    version: '1.5.0',
+    version: '1.6.0',
   },
   {
     capabilities: {
@@ -1016,10 +1152,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('Telegram Claude MCP server running (v1.5.0)');
+  console.error('Telegram Claude MCP server running (v1.6.0)');
 
   // Auto-start polling when server starts
   if (BOT_TOKEN && CHAT_ID) {
+    // Validate bot token by calling getMe
+    try {
+      const meResponse = await axiosInstance.get(`${API_BASE}/getMe`, { timeout: 10000 });
+      if (meResponse.data.ok) {
+        const bot = meResponse.data.result;
+        console.error(`Bot identity: @${bot.username} (${bot.first_name}, id: ${bot.id})`);
+      }
+    } catch (error) {
+      console.error('WARNING: getMe failed - bot token may be invalid:', error.message);
+    }
+
+    // Delete any existing webhook to ensure getUpdates works
+    // (If a webhook is set, getUpdates silently returns empty results)
+    try {
+      await axiosInstance.post(`${API_BASE}/deleteWebhook`, {}, { timeout: 10000 });
+      console.error('Webhook cleared (ensuring getUpdates works)');
+    } catch (error) {
+      console.error('WARNING: deleteWebhook failed:', error.message);
+    }
+
     const result = startPolling(2000);
     if (result.success) {
       console.error('Auto-polling started');

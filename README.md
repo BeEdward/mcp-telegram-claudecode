@@ -15,6 +15,8 @@ An MCP (Model Context Protocol) server that enables Claude Code to send and rece
 - Proxy support for regions where Telegram is blocked
 - **NEW: Remote permission approval via hooks** - Approve/deny sensitive operations from your phone
 - **NEW: Lock file mechanism** - Prevents multiple instance conflicts
+- **NEW: Hammerspoon injection (macOS)** - More reliable terminal injection via CGEvent API
+- **NEW: Auto webhook cleanup** - Ensures message receiving works even if a webhook was previously set
 
 ## Prerequisites
 
@@ -175,6 +177,7 @@ Make sure you've added the bot token to your `.claude.json` configuration.
 1. Make sure you started a conversation with your bot first
 2. Check that your `TELEGRAM_CHAT_ID` is correct
 3. If using a proxy, verify the proxy is working
+4. Check stderr logs for "Webhook cleared" message - if a webhook was previously set, `getUpdates` silently returns empty results (v1.6.0 fixes this automatically)
 
 ### Connection timeout or network error
 If you're in a region where Telegram is blocked:
@@ -324,14 +327,33 @@ The terminal injection feature uses `WriteConsoleInput` API for no-focus injecti
 | Platform | MCP Tools | Auto-Injection | Hooks |
 |----------|-----------|----------------|-------|
 | Windows | ✅ Full | ✅ SendKeys | ✅ Full |
-| macOS | ✅ Full | ❌ Not implemented | ✅ Full |
+| macOS | ✅ Full | ✅ Hammerspoon / ⚠️ AppleScript fallback | ✅ Full |
 | Linux | ✅ Full | ❌ Not implemented | ✅ Full |
 
-**Recommendation**: Use hooks for cross-platform remote control.
+**macOS Auto-Injection**: Requires [Hammerspoon](https://www.hammerspoon.org/) with the CLI tool enabled:
+1. Install Hammerspoon: `brew install --cask hammerspoon`
+2. Open Hammerspoon preferences
+3. Enable "Enable CLI tool (hs)" in the preferences
+4. The `hs` command should now be available in your terminal
+
+If Hammerspoon is not installed, falls back to AppleScript (clipboard + paste), which is less reliable and requires window focus.
+
+**Recommendation**: Use hooks for cross-platform remote control, or Hammerspoon on macOS for auto-injection.
 
 ---
 
 ## Changelog
+
+### v1.6.0
+- ✅ Fixed message receiving: auto-delete webhook on startup (getUpdates returns empty if webhook is set)
+- ✅ Added `getMe` diagnostic on startup to validate bot token
+- ✅ Added axios timeouts to polling/check requests to prevent hanging
+- ✅ Added Hammerspoon injection for macOS (more reliable than AppleScript)
+- ✅ AppleScript fallback when Hammerspoon is not installed
+
+### v1.5.0
+- ✅ Added video and document sending support
+- ✅ Improved terminal injection security
 
 ### v1.4.0
 - ✅ Added lock file mechanism to prevent multiple instance conflicts
