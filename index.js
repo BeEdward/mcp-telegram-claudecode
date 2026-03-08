@@ -299,6 +299,102 @@ async function checkNewMessages() {
 }
 
 /**
+ * Inject text into terminal using tmux send-keys
+ * Most reliable method - works without window focus, no clipboard needed
+ * Detects the tmux pane where this MCP server process is running
+ * Returns: { success: boolean, error?: string, method?: string }
+ */
+function injectViaTmux(text) {
+  try {
+    // Check if tmux is available and we're inside a tmux session
+    try {
+      execSync('which tmux', { encoding: 'utf8', timeout: 5000 });
+    } catch {
+      return { success: false, error: 'tmux not found' };
+    }
+
+    // Check if there are any tmux sessions running
+    try {
+      execSync('tmux list-sessions', { encoding: 'utf8', timeout: 5000 });
+    } catch {
+      return { success: false, error: 'No tmux sessions running' };
+    }
+
+    const singleLine = text.replace(/[\r\n]+/g, ' ').trim();
+    if (!singleLine) {
+      return { success: false, error: 'Empty text' };
+    }
+
+    // Find the tmux pane running claude code by looking for our parent process
+    // The MCP server is spawned by claude, so we find the pane running claude
+    let targetPane = null;
+    try {
+      // List all panes with their running commands
+      const panes = execSync(
+        'tmux list-panes -a -F "#{pane_id} #{pane_current_command} #{pane_pid}"',
+        { encoding: 'utf8', timeout: 5000 }
+      ).trim().split('\n');
+
+      // Look for a pane running claude or node (our parent process)
+      const ppid = process.ppid;
+      for (const pane of panes) {
+        const parts = pane.split(' ');
+        const paneId = parts[0];
+        const cmd = parts[1] || '';
+        const panePid = parts[2] || '';
+
+        // Check if this pane's process is our ancestor
+        if (cmd.includes('claude') || cmd.includes('node')) {
+          // Verify by checking process tree
+          try {
+            const pids = execSync(
+              `pgrep -P ${panePid} 2>/dev/null || echo ""`,
+              { encoding: 'utf8', timeout: 5000 }
+            ).trim();
+            // Check if our process or parent is a descendant of this pane
+            if (pids.includes(String(ppid)) || pids.includes(String(process.pid))) {
+              targetPane = paneId;
+              break;
+            }
+          } catch {}
+        }
+      }
+
+      // Fallback: if we couldn't find by process tree, use the active pane
+      // with claude in its command
+      if (!targetPane) {
+        for (const pane of panes) {
+          const parts = pane.split(' ');
+          if (parts[1] && parts[1].includes('claude')) {
+            targetPane = parts[0];
+            break;
+          }
+        }
+      }
+    } catch (error) {
+      return { success: false, error: `Failed to find tmux pane: ${error.message}` };
+    }
+
+    if (!targetPane) {
+      return { success: false, error: 'Could not find Claude Code tmux pane' };
+    }
+
+    // Use tmux send-keys to inject text + Enter
+    // Escape single quotes for shell
+    const escaped = singleLine.replace(/'/g, "'\\''");
+    execSync(`tmux send-keys -t ${targetPane} '${escaped}' Enter`, {
+      encoding: 'utf8',
+      timeout: 5000
+    });
+
+    return { success: true, method: `tmux (pane ${targetPane})` };
+  } catch (error) {
+    console.error('tmux injection failed:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
  * Inject text into terminal using Hammerspoon (hs CLI)
  * More reliable than AppleScript - uses CGEvent API
  * Returns: { success: boolean, error?: string, method?: string }
@@ -351,7 +447,14 @@ function injectViaHammerspoon(text) {
  * Returns: { success: boolean, error?: string, method?: string }
  */
 function injectToTerminalMacOS(text) {
-  // Try Hammerspoon first (more reliable)
+  // Try tmux first (most reliable - no focus needed, no clipboard)
+  const tmuxResult = injectViaTmux(text);
+  if (tmuxResult.success) {
+    return tmuxResult;
+  }
+  console.error('tmux injection unavailable:', tmuxResult.error);
+
+  // Try Hammerspoon next
   const hsResult = injectViaHammerspoon(text);
   if (hsResult.success) {
     return hsResult;
@@ -391,6 +494,8 @@ try
     set terminalApp to "Alacritty"
   else if procNames contains "WezTerm" then
     set terminalApp to "WezTerm"
+  else if procNames contains "Hyper" then
+    set terminalApp to "Hyper"
   end if
 on error
   set terminalApp to ""
